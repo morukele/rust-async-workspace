@@ -1,3 +1,5 @@
+mod macros;
+
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
@@ -7,6 +9,13 @@ use std::{future::Future, panic::catch_unwind, thread};
 use async_task::{Runnable, Task};
 use flume::{Receiver, Sender};
 use futures_lite::future;
+use http::Uri;
+use hyper::{Client, Request};
+
+use anyhow::{Context as _, Error, Result, bail};
+use smol::{Async, io, prelude::*};
+use std::net::Shutdown;
+use std::net::{TcpStream, ToSocketAddrs};
 
 #[derive(Debug, Clone, Copy)]
 enum FutureType {
@@ -24,7 +33,7 @@ impl Future for CounterFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.count += 1;
         println!("polling with result: {}", self.count);
-        std::thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(1));
         if self.count < 3 {
             cx.waker().wake_by_ref();
             Poll::Pending
@@ -40,22 +49,22 @@ where
     T: Send + 'static,
 {
     static HIGH_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
-        LazyLock::new(|| flume::unbounded::<Runnable>());
+        LazyLock::new(flume::unbounded::<Runnable>);
     static LOW_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
-        LazyLock::new(|| flume::unbounded::<Runnable>());
+        LazyLock::new(flume::unbounded::<Runnable>);
 
-    static HIGH_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
+    static HIGH_QUEUE: LazyLock<Sender<Runnable>> = LazyLock::new(|| {
         let high_num = std::env::var("HIGH_NUM")
             .unwrap()
             .parse::<usize>()
             .unwrap_or(2);
         for _ in 0..high_num {
             // Stealing logic for high priority queue
-            let high_reciever = HIGH_CHANNEL.1.clone();
+            let high_receiver = HIGH_CHANNEL.1.clone();
             let low_receiver = LOW_CHANNEL.1.clone();
             thread::spawn(move || {
                 loop {
-                    match high_reciever.try_recv() {
+                    match high_receiver.try_recv() {
                         Ok(runnable) => {
                             let _ = catch_unwind(|| runnable.run());
                         }
@@ -74,22 +83,22 @@ where
         HIGH_CHANNEL.0.clone()
     });
 
-    static LOW_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
+    static LOW_QUEUE: LazyLock<Sender<Runnable>> = LazyLock::new(|| {
         let low_num = std::env::var("LOW_NUM")
             .unwrap()
             .parse::<usize>()
             .unwrap_or(1);
         for _ in 0..low_num {
-            let low_reciever = LOW_CHANNEL.1.clone();
-            let high_reciever = HIGH_CHANNEL.1.clone();
+            let low_receiver = LOW_CHANNEL.1.clone();
+            let high_receiver = HIGH_CHANNEL.1.clone();
             thread::spawn(move || {
                 // Stealing logic for low priority queue
                 loop {
-                    match low_reciever.try_recv() {
+                    match low_receiver.try_recv() {
                         Ok(runnable) => {
                             let _ = catch_unwind(|| runnable.run());
                         }
-                        Err(_) => match high_reciever.try_recv() {
+                        Err(_) => match high_receiver.try_recv() {
                             Ok(runnable) => {
                                 let _ = catch_unwind(|| runnable.run());
                             }
@@ -161,9 +170,16 @@ macro_rules! try_join {
     };
 }
 
-async fn async_fn() {
-    thread::sleep(Duration::from_secs(1));
-    println!("async fn");
+struct CustomExecutor;
+
+impl<F: Future + Send + 'static> hyper::rt::Executor<F> for CustomExecutor {
+    fn execute(&self, fut: F) {
+        spawn_task!(async {
+            println!("sending request");
+            fut.await;
+        })
+        .detach();
+    }
 }
 
 struct Runtime {
@@ -173,7 +189,7 @@ struct Runtime {
 
 impl Runtime {
     pub fn new() -> Self {
-        let num_cores = std::thread::available_parallelism().unwrap().get();
+        let num_cores = thread::available_parallelism().unwrap().get();
         Self {
             high_num: num_cores - 2,
             low_num: 1,
@@ -211,7 +227,7 @@ impl Future for BackgroundProcess {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         println!("background process firing");
-        std::thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_secs(1));
         cx.waker().wake_by_ref();
         Poll::Pending
     }
@@ -221,26 +237,22 @@ fn main() {
     Runtime::new().with_low_num(2).with_high_num(4).run();
     spawn_task!(BackgroundProcess {}).detach();
 
-    let one = CounterFuture { count: 0 };
-    let two = CounterFuture { count: 0 };
-    let three = CounterFuture { count: 0 };
-    let t_one = spawn_task!(one, FutureType::High);
-    let t_two = spawn_task!(two);
-    let t_three = spawn_task!(three);
-    let t_four = spawn_task!(
-        async {
-            async_fn().await;
-            async_fn().await;
-            async_fn().await;
-            async_fn().await;
-            async_fn().await;
-        },
-        FutureType::High
-    );
+    let url = "http://www.rust-lang.org";
+    let url: Uri = url.parse().unwrap();
 
-    std::thread::sleep(Duration::from_secs(5));
-    println!("before the block");
+    let request = Request::builder()
+        .method("GET")
+        .uri(url)
+        .header("User-Agent", "hyper/0.14.2")
+        .header("Accept", "text/html")
+        .body(hyper::Body::empty())
+        .unwrap();
 
-    let outcome = try_join!(t_one, t_two, t_three);
-    let outcome_two = try_join!(t_four);
+    let future = async {
+        let client = Client::new();
+        client.request(request).await.unwrap()
+    };
+    let test = spawn_task!(future);
+    let response = future::block_on(test);
+    println!("Response status: {}", response.status());
 }
