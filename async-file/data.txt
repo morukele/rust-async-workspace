@@ -1,7 +1,0 @@
-Hello worlds, why is this showing up in the screen?
-This is a very interesting approach to realtime typing.
-I added a line of code to clear the screen before new output
-
-But it is not working
-
-Will it work?
