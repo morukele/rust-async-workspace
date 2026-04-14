@@ -19,7 +19,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use tokio::io::{ReadBuf, join};
 
 #[derive(Debug, Clone, Copy)]
-enum FutureType {
+pub enum FutureType {
     High,
     Low,
 }
@@ -44,7 +44,7 @@ impl Future for CounterFuture {
     }
 }
 
-fn spawn_task<F, T>(future: F, order: FutureType) -> Task<T>
+pub fn spawn_task<F, T>(future: F, order: FutureType) -> Task<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
