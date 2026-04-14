@@ -1,13 +1,13 @@
 use mio::net::TcpListener;
 use mio::{Events, Poll as MioPoll, Token};
+use runtime;
+use runtime::Runtime;
 use std::error::Error;
 use std::future::Future;
 use std::io::Read;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-
-// TODO: convert the runtime into a library to use for the project
 
 const SERVER: Token = Token(0);
 const CLIENT: Token = Token(1);
@@ -62,5 +62,6 @@ impl Future for ServerFuture {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    Runtime::new().with_low_num(2).with_high_num(4).run();
     Ok(())
 }
