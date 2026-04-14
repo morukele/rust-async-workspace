@@ -1,10 +1,10 @@
-use mio::net::TcpListener;
-use mio::{Events, Poll as MioPoll, Token};
-use runtime;
-use runtime::Runtime;
+use futures_lite::future;
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll as MioPoll, Token};
+use runtime::{FutureType, Runtime, spawn_task};
 use std::error::Error;
 use std::future::Future;
-use std::io::Read;
+use std::io::{ErrorKind, Read, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -63,5 +63,37 @@ impl Future for ServerFuture {
 
 fn main() -> Result<(), Box<dyn Error>> {
     Runtime::new().with_low_num(2).with_high_num(4).run();
+
+    let addr = "127.0.0.1:13265".parse()?;
+    let mut server = TcpListener::bind(addr)?;
+    let mut stream = TcpStream::connect(server.local_addr()?)?;
+
+    let poll: MioPoll = MioPoll::new()?;
+    poll.registry()
+        .register(&mut server, SERVER, Interest::READABLE)?;
+
+    let server_worker = ServerFuture { server, poll };
+    let test = spawn_task!(server_worker);
+
+    let mut client_poll: MioPoll = MioPoll::new()?;
+    client_poll.registry().register(
+        &mut stream,
+        CLIENT,
+        Interest::READABLE | Interest::WRITABLE,
+    )?;
+
+    let mut events = Events::with_capacity(128);
+    client_poll.poll(&mut events, None)?;
+
+    for event in events.iter() {
+        if event.token() == CLIENT && event.is_writable() {
+            let message = "that's dingo!\n";
+            let _ = stream.write_all(message.as_bytes());
+        }
+    }
+
+    let outcome = future::block_on(test);
+    println!("outcome {}", outcome);
+
     Ok(())
 }
