@@ -1,0 +1,5 @@
+[toolchain]
+channel = "nightly-aarch64-apple-darwin"
+components = ["rustfmt", "rustc-dev"]
+targets = ["aarch64-apple-darwin"]
+profile = "default"
