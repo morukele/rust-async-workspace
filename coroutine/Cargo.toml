@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 rand = "0.10.1"
+tokio = { version = "1.52.0", features = ["full"] }

@@ -5,6 +5,8 @@
 #![feature(coroutines)]
 #![feature(coroutine_trait)]
 
+pub mod test;
+
 use rand::{Rng, RngExt};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -12,6 +14,7 @@ use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::ops::{Coroutine, CoroutineState};
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 struct WriteCoroutine {
@@ -146,6 +149,20 @@ impl Coroutine<()> for SleepCoroutine {
     }
 }
 
+impl Future for SleepCoroutine {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self).resume(()) {
+            CoroutineState::Complete(_) => Poll::Ready(()),
+            CoroutineState::Yielded(_) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+}
+
 type CustomCoroutine = Pin<Box<dyn Coroutine<(), Yield = (), Return = ()>>>;
 struct Executor {
     coroutines: VecDeque<CustomCoroutine>,
@@ -170,25 +187,67 @@ impl Executor {
             .expect("no more coroutine in queue");
 
         match coroutine.as_mut().resume(()) {
-            std::ops::CoroutineState::Yielded(_) => self.coroutines.push_back(coroutine),
-            std::ops::CoroutineState::Complete(_) => {} // if it is completed, do nothing
+            CoroutineState::Yielded(_) => self.coroutines.push_back(coroutine),
+            CoroutineState::Complete(_) => {} // if it is completed, do nothing
         }
     }
 }
 
+struct RandCoroutine {
+    pub value: u8,
+    pub live: bool,
+}
+
+impl RandCoroutine {
+    fn new() -> Self {
+        let mut coroutine = Self {
+            value: 0,
+            live: true,
+        };
+        coroutine.generate();
+        coroutine
+    }
+
+    fn generate(&mut self) {
+        let mut rng = rand::rng();
+        self.value = rng.random_range(0..=10);
+    }
+}
+
+impl Coroutine<()> for RandCoroutine {
+    type Yield = u8;
+    type Return = ();
+
+    fn resume(mut self: Pin<&mut Self>, arg: ()) -> CoroutineState<Self::Yield, Self::Return> {
+        self.generate();
+        CoroutineState::Yielded(self.value)
+    }
+}
+
 fn main() -> io::Result<()> {
-    let mut executor = Executor::new();
-    for i in 0..3 {
-        executor.add(Box::pin(SleepCoroutine::new(Duration::from_secs(1))));
-    }
+    let (sender, receiver) = std::sync::mpsc::channel::<RandCoroutine>();
+    std::thread::spawn(move || {
+        while let Ok(coroutine) = receiver.recv() {
+            let mut coroutine = coroutine;
+            match Pin::new(&mut coroutine).resume(()) {
+                CoroutineState::Yielded(res) => {
+                    println!("Coroutine yielded: {}", res);
+                }
+                CoroutineState::Complete(_) => {
+                    panic!("Coroutine completed, this should not happen");
+                }
+            }
+        }
+    });
 
-    let mut counter = 0;
-    let start = Instant::now();
-
-    while !executor.coroutines.is_empty() {
-        executor.poll();
-    }
-    println!("Total time taken: {:?}", start.elapsed());
+    std::thread::sleep(Duration::from_secs(1));
+    sender
+        .send(RandCoroutine::new())
+        .expect("Unable to send coroutine into channel");
+    sender
+        .send(RandCoroutine::new())
+        .expect("Unable to send coroutine into channel");
+    std::thread::sleep(Duration::from_secs(1));
 
     Ok(())
 }
