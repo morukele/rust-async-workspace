@@ -4,6 +4,7 @@ use std::future::Future;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio_util::task::LocalPoolHandle;
 
@@ -82,25 +83,59 @@ async fn print_statement() {
     });
 }
 
-#[tokio::main(flavor = "current_thread")]
+static POOL_RUNTIME: LazyLock<LocalPoolHandle> = LazyLock::new(|| LocalPoolHandle::new(4));
+
+fn extract_data_from_thread() -> HashMap<u32, u32> {
+    let mut extracted_counter: HashMap<u32, u32> = HashMap::new();
+    COUNTER.with(|counter| {
+        let counter = unsafe { &mut *counter.get() };
+        extracted_counter = counter.clone();
+    });
+
+    extracted_counter
+}
+
+async fn get_complete_count() -> HashMap<u32, u32> {
+    let mut complete_counter = HashMap::new();
+    let mut extracted_counters = Vec::new();
+    for i in 0..4 {
+        extracted_counters.push(
+            POOL_RUNTIME.spawn_pinned_by_idx(|| async move { extract_data_from_thread() }, i),
+        );
+    }
+    for counter_future in extracted_counters {
+        let extracted_counter = counter_future.await.unwrap_or_default();
+        for (key, count) in extracted_counter {
+            *complete_counter.entry(key).or_insert(0) += count;
+        }
+    }
+
+    complete_counter
+}
+
+#[tokio::main]
 async fn main() {
-    let pool = LocalPoolHandle::new(1);
-    let sequence = [1, 2, 3, 4, 5];
-    let repeated_sequence: Vec<_> = sequence.iter().cycle().take(500_000).cloned().collect();
+    tokio::spawn(async {
+        let sequence = [1, 2, 3, 4, 5];
+        let repeated_sequence: Vec<_> = sequence.iter().cycle().take(500_000).cloned().collect();
 
-    let mut futures = Vec::new();
-    for number in repeated_sequence {
-        futures.push(pool.spawn_pinned(move || async move {
-            something(number).await;
-            something(number).await;
-        }));
-    }
+        let mut futures = Vec::new();
+        for number in repeated_sequence {
+            futures.push(POOL_RUNTIME.spawn_pinned(move || async move {
+                something(number).await;
+                something(number).await;
+            }));
+        }
 
-    for i in futures {
-        i.await.unwrap();
-    }
-
-    pool.spawn_pinned(|| async { print_statement().await })
-        .await
-        .unwrap();
+        for i in futures {
+            i.await.unwrap();
+        }
+        println!("All futures completed");
+    });
+    let pid = std::process::id();
+    println!("The PID of this process is: {}", pid);
+    let mut stream = signal(SignalKind::hangup()).unwrap();
+    stream.recv().await;
+    let completed_counter = get_complete_count().await;
+    println!("Complete counter: {:?}", completed_counter);
 }
