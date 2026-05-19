@@ -8,6 +8,7 @@ use tokio::sync::{
     mpsc::{Receiver, Sender},
     oneshot,
 };
+use tokio::time::{self, Duration, Instant};
 
 struct SetKeyValueMessage {
     key: String,
@@ -33,48 +34,89 @@ enum KeyValueMessage {
 
 enum RoutingMessage {
     KeyValue(KeyValueMessage),
+    Heartbeat(ActorType),
+    Reset(ActorType),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ActorType {
+    KeyValue,
+    Writer,
 }
 
 async fn key_value_actor(mut receiver: Receiver<KeyValueMessage>) {
     let (writer_key_value_sender, writer_key_value_receiver) = channel(32);
-    tokio::spawn(writer_actor(writer_key_value_receiver));
+    let _writer_handle = tokio::spawn(writer_actor(writer_key_value_receiver));
 
-    // Getting the sate of the map from the writer actor
+    // Getting the state of the map from the writer actor
     let (get_sender, get_receiver) = oneshot::channel();
     let _ = writer_key_value_sender
         .send(WriterLogMessage::Get(get_sender))
         .await; // consider unwrapping later
     let mut map = get_receiver.await.unwrap();
 
-    while let Some(message) = receiver.recv().await {
-        if let Some(write_message) = WriterLogMessage::from_key_value_message(&message) {
-            let _ = writer_key_value_sender.send(write_message).await;
-        }
-        match message {
-            KeyValueMessage::Get(data) => {
-                let _ = data.response.send(map.get(&data.key).cloned());
+    let timeout_duration = Duration::from_millis(200);
+    let router_sender = ROUTER_SENDER.get().unwrap().clone();
+
+    loop {
+        match time::timeout(timeout_duration, receiver.recv()).await {
+            Ok(Some(message)) => {
+                while let Some(message) = receiver.recv().await {
+                    if let Some(write_message) = WriterLogMessage::from_key_value_message(&message)
+                    {
+                        let _ = writer_key_value_sender.send(write_message).await;
+                    }
+                    match message {
+                        KeyValueMessage::Get(data) => {
+                            let _ = data.response.send(map.get(&data.key).cloned());
+                        }
+                        KeyValueMessage::Delete(data) => {
+                            map.remove(&data.key);
+                            let _ = data.response.send(());
+                        }
+                        KeyValueMessage::Set(data) => {
+                            map.insert(data.key, data.value);
+                            let _ = data.response.send(());
+                        }
+                    }
+                }
             }
-            KeyValueMessage::Delete(data) => {
-                map.remove(&data.key);
-                let _ = data.response.send(());
-            }
-            KeyValueMessage::Set(data) => {
-                map.insert(data.key, data.value);
-                let _ = data.response.send(());
+            Ok(None) => break,
+            Err(_) => {
+                router_sender
+                    .send(RoutingMessage::Heartbeat(ActorType::KeyValue))
+                    .await
+                    .unwrap();
             }
         }
     }
 }
 
 async fn router(mut receiver: Receiver<RoutingMessage>) {
-    let (key_value_sender, key_value_receiver) = channel(32);
-    tokio::spawn(key_value_actor(key_value_receiver));
+    let (mut key_value_sender, mut key_value_receiver) = channel(32);
+    let mut key_value_handle = tokio::spawn(key_value_actor(key_value_receiver));
+
+    let (heartbeat_sender, heartbeat_receiver) = channel(32);
+    tokio::spawn(heartbeat_actor(heartbeat_receiver));
 
     while let Some(message) = receiver.recv().await {
         match message {
             RoutingMessage::KeyValue(message) => {
                 let _ = key_value_sender.send(message).await;
             }
+            RoutingMessage::Heartbeat(message) => {
+                let _ = heartbeat_sender.send(message).await;
+            }
+            RoutingMessage::Reset(message) => match message {
+                ActorType::KeyValue | ActorType::Writer => {
+                    let (new_key_value_sender, new_key_value_receiver) = channel(32);
+                    key_value_handle.abort();
+                    key_value_sender = new_key_value_sender;
+                    key_value_receiver = new_key_value_receiver;
+                    key_value_handle = tokio::spawn(key_value_actor(key_value_receiver));
+                    time::sleep(Duration::from_millis(100)).await;
+                }
+            },
         }
     }
 }
@@ -172,25 +214,71 @@ async fn writer_actor(mut receiver: Receiver<WriterLogMessage>) -> io::Result<()
     let mut map = load_map("./data.json").await;
     let mut file = File::create("./data.json").await.unwrap();
 
-    while let Some(message) = receiver.recv().await {
-        match message {
-            WriterLogMessage::Set(key, value) => {
-                map.insert(key, value);
+    let timeout_duration = Duration::from_millis(200);
+    let router_sender = ROUTER_SENDER.get().unwrap().clone();
+
+    loop {
+        match time::timeout(timeout_duration, receiver.recv()).await {
+            Ok(Some(message)) => {
+                match message {
+                    WriterLogMessage::Set(key, value) => {
+                        map.insert(key, value);
+                    }
+                    WriterLogMessage::Delete(key) => {
+                        map.remove(&key);
+                    }
+                    WriterLogMessage::Get(response) => {
+                        let _ = response.send(map.clone());
+                    }
+                }
+                let contents = serde_json::to_string(&map).unwrap();
+                file.set_len(0).await?;
+                file.seek(std::io::SeekFrom::Start(0)).await?;
+                file.write_all(contents.as_bytes()).await?;
+                file.flush().await?;
             }
-            WriterLogMessage::Delete(key) => {
-                map.remove(&key);
-            }
-            WriterLogMessage::Get(response) => {
-                let _ = response.send(map.clone());
-            }
+            Ok(None) => break,
+            Err(_) => router_sender
+                .send(RoutingMessage::Heartbeat(ActorType::Writer))
+                .await
+                .unwrap(),
         }
-        let contents = serde_json::to_string(&map).unwrap();
-        file.set_len(0).await?;
-        file.seek(std::io::SeekFrom::Start(0)).await?;
-        file.write_all(contents.as_bytes()).await?;
-        file.flush().await?;
     }
     Ok(())
+}
+
+async fn heartbeat_actor(mut receiver: Receiver<ActorType>) {
+    let mut map = HashMap::new();
+    let timeout_duration = Duration::from_millis(200);
+    loop {
+        match time::timeout(timeout_duration, receiver.recv()).await {
+            Ok(Some(actor_name)) => map.insert(actor_name, Instant::now()),
+            Ok(None) => break,
+            Err(_) => {
+                continue;
+            }
+        };
+        let half_second_ago = Instant::now() - Duration::from_millis(500);
+        for (key, &value) in map.iter() {
+            if value < half_second_ago {
+                match key {
+                    ActorType::KeyValue | ActorType::Writer => {
+                        ROUTER_SENDER
+                            .get()
+                            .unwrap()
+                            .send(RoutingMessage::Reset(ActorType::KeyValue))
+                            .await
+                            .unwrap();
+
+                        map.remove(&ActorType::KeyValue);
+                        map.remove(&ActorType::Writer);
+
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -199,15 +287,25 @@ async fn main() -> Result<(), std::io::Error> {
     ROUTER_SENDER.set(sender).unwrap(); // setting the static sender value
     tokio::spawn(router(receiver));
 
-    set("hello".to_owned(), b"world".to_vec()).await?;
-    set("bonjour".to_owned(), b"le monde".to_vec()).await?;
-    set("migwo".to_owned(), b"sir".to_vec()).await?;
+    let _ = set("hello".to_string(), b"world".to_vec()).await?;
+    let value = get("hello".to_string()).await?;
+    println!("value: {:?}", value);
 
-    let value = get("hello".to_owned()).await?;
-    println!("value: {:?}", String::from_utf8(value.unwrap()));
+    let value = get("hello".to_string()).await?;
+    println!("value: {:?}", value);
 
-    let value = get("bonjour".to_owned()).await?;
-    println!("value: {:?}", String::from_utf8(value.unwrap()));
+    ROUTER_SENDER
+        .get()
+        .unwrap()
+        .send(RoutingMessage::Reset(ActorType::KeyValue))
+        .await
+        .unwrap();
+
+    let value = get("hello".to_string()).await?;
+    println!("value: {:?}", value);
+
+    set("test".to_string(), b"world".to_vec()).await?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
 
     Ok(())
 }
